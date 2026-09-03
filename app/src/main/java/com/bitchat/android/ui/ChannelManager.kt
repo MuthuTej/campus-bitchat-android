@@ -122,10 +122,28 @@ class ChannelManager(
     
     // MARK: - Channel Password and Encryption
     
+    /**
+     * Check a candidate password against the channel's key commitment.
+     *
+     * A commitment is SHA-256 over the derived AES key, recorded whenever this device establishes a
+     * password for a channel. Comparing commitments proves the candidate derives the same key
+     * without ever comparing passwords or keys directly.
+     *
+     * When no commitment is known the password cannot be checked locally at all: BitChat has no
+     * server to ask, and a channel's key is only demonstrated by successfully decrypting traffic.
+     * In that case we accept, exactly as before, and the wrong key simply fails to decrypt. This
+     * preserves upstream join behaviour while making the check real wherever it can be made real.
+     */
     private fun verifyChannelPassword(channel: String, password: String): Boolean {
-        // TODO: REMOVE THIS - FOR TESTING ONLY
-        return true
+        val commitment = channelKeyCommitments[channel] ?: return true
+        return commitmentFor(deriveChannelKey(password, channel)) == commitment
     }
+
+    /** SHA-256 of the derived key. Safe to retain: it does not reveal the key or the password. */
+    private fun commitmentFor(key: SecretKeySpec): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(key.encoded)
+            .joinToString("") { "%02x".format(it) }
     
     private fun deriveChannelKey(password: String, channelName: String): SecretKeySpec {
         // PBKDF2 key derivation (same as iOS version)
@@ -240,7 +258,11 @@ class ChannelManager(
 
         channelPasswords[channel] = password
 
-        channelKeys[channel] = deriveChannelKey(password, channel)
+        val derivedKey = deriveChannelKey(password, channel)
+        channelKeys[channel] = derivedKey
+        // Record the commitment so a later join attempt with a different password is rejected
+        // rather than silently accepted. See verifyChannelPassword.
+        channelKeyCommitments[channel] = commitmentFor(derivedKey)
 
         state.setPasswordProtectedChannels(
             state.getPasswordProtectedChannelsValue().toMutableSet().apply { add(channel) }

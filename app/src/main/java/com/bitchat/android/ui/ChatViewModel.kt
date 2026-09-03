@@ -683,6 +683,16 @@ class ChatViewModel(
     fun switchToChannel(channel: String?) {
         channelManager.switchToChannel(channel)
     }
+
+    /**
+     * Install a channel password programmatically, deriving and caching its AES key.
+     *
+     * Exposed so a UI layer can provision channels without routing a /pass command through the
+     * command processor. Used by the campus overlay to enrol devices into class channels silently.
+     */
+    fun setChannelPassword(channel: String, password: String) {
+        channelManager.setChannelPassword(channel, password)
+    }
     
     fun leaveChannel(channel: String) {
         channelManager.leaveChannel(channel)

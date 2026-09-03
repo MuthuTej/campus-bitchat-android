@@ -38,6 +38,14 @@ android {
             "\"$normalizedGithubReleaseCertSha256\""
         )
 
+        // Campus overlay: swaps the technical chat surface for the three-tab academic shell.
+        // Override with -PcampusMode=false to build the stock upstream UI from the same tree.
+        buildConfigField(
+            "boolean",
+            "CAMPUS_MODE",
+            (project.findProperty("campusMode")?.toString() ?: "true")
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true

@@ -39,6 +39,8 @@ import com.bitchat.android.onboarding.OnboardingCoordinator
 import com.bitchat.android.onboarding.OnboardingState
 import com.bitchat.android.onboarding.PermissionExplanationScreen
 import com.bitchat.android.onboarding.PermissionManager
+import com.bitchat.android.campus.CampusViewModel
+import com.bitchat.android.campus.ui.CampusShell
 import com.bitchat.android.ui.ChatScreen
 import com.bitchat.android.ui.ChatViewModel
 import com.bitchat.android.ui.OrientationAwareActivity
@@ -314,10 +316,17 @@ class MainActivity : OrientationAwareActivity() {
 
             OnboardingState.CHECKING, OnboardingState.INITIALIZING, OnboardingState.COMPLETE -> {
                 // Set up back navigation handling for the chat screen
+                // The campus overlay owns its own tab/detail navigation, so it gets first refusal
+                // on the back gesture before the stock chat navigation state is consulted.
+                val campusViewModel = remember(chatViewModel) {
+                    if (BuildConfig.CAMPUS_MODE) CampusViewModel(application, chatViewModel) else null
+                }
+
                 val backCallback = object : OnBackPressedCallback(true) {
                     override fun handleOnBackPressed() {
                         // Let ChatViewModel handle navigation state
-                        val handled = chatViewModel.handleBackPressed()
+                        val handled = campusViewModel?.handleBackPressed()
+                            ?: chatViewModel.handleBackPressed()
                         if (!handled) {
                             // If ChatViewModel doesn't handle it, disable this callback
                             // and let the system handle it (which will exit the app)
@@ -330,7 +339,11 @@ class MainActivity : OrientationAwareActivity() {
 
                 // Add the callback - this will be automatically removed when the activity is destroyed
                 onBackPressedDispatcher.addCallback(this, backCallback)
-                ChatScreen(viewModel = chatViewModel)
+                if (campusViewModel != null) {
+                    CampusShell(viewModel = campusViewModel)
+                } else {
+                    ChatScreen(viewModel = chatViewModel)
+                }
             }
             
             OnboardingState.ERROR -> {
