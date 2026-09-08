@@ -31,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.bitchat.android.messaging.contacts.Contact
 import com.bitchat.android.messaging.identity.MessagingPublicKey
 
 /** The groups this user belongs to, and the way in to making another. */
@@ -104,7 +105,14 @@ fun CreateGroupScreen(
     onCreated: () -> Unit,
     onCancel: () -> Unit
 ) {
-    val contacts by viewModel.savedContacts.collectAsState()
+    // Everyone this device knows, not only people explicitly saved. Requiring a contact to be
+    // saved first meant a user who had just met someone on the mesh could not put them in a group,
+    // which is the most common way a group gets made in the first place. Reachable people are shown
+    // first, since an invitation reaches them straight away.
+    val known by viewModel.allKnown.collectAsState()
+    val contacts = remember(known) {
+        known.sortedWith(compareByDescending<Contact> { it.canReachNow }.thenBy { it.displayName })
+    }
     var name by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
     var announcementOnly by remember { mutableStateOf(false) }
@@ -152,7 +160,7 @@ fun CreateGroupScreen(
 
         if (contacts.isEmpty()) {
             Text(
-                text = "You have no saved contacts yet. Add people from the Contacts tab first.",
+                text = "Nobody nearby yet. People appear here once their device is in range.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -179,7 +187,16 @@ fun CreateGroupScreen(
                         onCheckedChange = null
                     )
                     Avatar(contact.displayName, sizeDp = 36)
-                    Text(contact.displayName, style = MaterialTheme.typography.bodyLarge)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(contact.displayName, style = MaterialTheme.typography.bodyLarge)
+                        if (!contact.canReachNow) {
+                            Text(
+                                text = "Not reachable now",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             }
         }

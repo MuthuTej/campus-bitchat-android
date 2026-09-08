@@ -83,9 +83,6 @@ class GroupMessageManager(
 
     fun messagesFor(groupId: String): List<GroupMessage> = _messages.value[groupId].orEmpty()
 
-    /** Channel the group's traffic is broadcast on. Derived, so every member computes the same one. */
-    fun channelTagFor(groupId: String): String = "$CHANNEL_PREFIX$groupId"
-
     fun send(groupId: String, text: String): SendResult {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return SendResult.EmptyMessage
@@ -175,6 +172,25 @@ class GroupMessageManager(
         return ReceiveResult.Accepted(message)
     }
 
+    /**
+     * Which group an arriving message proves its sender belongs to, if any.
+     *
+     * Membership lists are learned piecemeal — an invitation cannot carry every member — so a
+     * legitimate member's first message can arrive from someone this device has no record of. The
+     * question answered here is not "who does the message claim to be from" but "does it open under
+     * a key only members hold", which is the one claim a non-member cannot manufacture.
+     *
+     * Returns null unless the message decrypts, so an outsider replaying group bytes, or a member
+     * of a *different* group, cannot talk their way onto a membership list.
+     */
+    fun groupProvenByDecryption(content: String, sender: MessagingPublicKey): String? {
+        val wire = decodeGroupWire(content) ?: return null
+        if (!wire.senderKeyHex.equals(sender.hex, ignoreCase = true)) return null
+        val key = keys.keyForVersion(wire.groupId, wire.keyVersion) ?: return null
+        GroupCipher.open(key, wire.sealed) ?: return null
+        return wire.groupId
+    }
+
     private fun record(message: GroupMessage) {
         val bucket = messagesByGroup.getOrPut(message.groupId) { mutableListOf() }
         if (bucket.any { it.messageId == message.messageId }) return
@@ -193,17 +209,26 @@ class GroupMessageManager(
         val sealed: String
     )
 
-    private companion object {
-        const val CHANNEL_PREFIX = "#g_"
+    companion object {
+        /**
+         * Channel a group's traffic is broadcast on.
+         *
+         * Derived from the group id so every member computes the same one without being told it,
+         * and available without an instance because a device must be able to start listening to a
+         * restored group before the messaging managers are built.
+         */
+        fun channelTagFor(groupId: String): String = "$CHANNEL_PREFIX$groupId"
 
-        const val WIRE_PREFIX = "BCG1:"
+        private const val CHANNEL_PREFIX = "#g_"
+
+        private const val WIRE_PREFIX = "BCG1:"
 
         /**
          * Group traffic carries its own addressing because it travels a different path from a
          * direct message: it is broadcast to a channel, so the transport cannot say who it is for
          * or which group it belongs to.
          */
-        fun encodeGroupWire(
+        private fun encodeGroupWire(
             groupId: String,
             messageId: String,
             senderKeyHex: String,
@@ -213,9 +238,9 @@ class GroupMessageManager(
             Canonical.encode(groupId, messageId, senderKeyHex, keyVersion.toString(), sealed)
         )
 
-        fun looksLikeGroupWire(content: String): Boolean = content.startsWith(WIRE_PREFIX)
+        private fun looksLikeGroupWire(content: String): Boolean = content.startsWith(WIRE_PREFIX)
 
-        fun decodeGroupWire(content: String): GroupWire? {
+        private fun decodeGroupWire(content: String): GroupWire? {
             if (!looksLikeGroupWire(content)) return null
             val raw = Canonical.unb64(content.removePrefix(WIRE_PREFIX)) ?: return null
             val fields = Canonical.decodeFields(raw, expected = 5) ?: return null

@@ -1,6 +1,7 @@
 package com.bitchat.android.messaging.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,11 +17,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -34,7 +39,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.heightIn
 import com.bitchat.android.messaging.groups.GroupPermission
+import com.bitchat.android.messaging.identity.MessagingPublicKey
 
 /**
  * A group conversation.
@@ -61,6 +68,23 @@ fun GroupChatScreen(
         group.can(localKey!!, GroupPermission.CAN_SEND_MESSAGES)
 
     var draft by remember { mutableStateOf("") }
+    var addingPeople by remember { mutableStateOf(false) }
+
+    // Only an administrator's invitations are accepted by the other devices, so the action is
+    // offered only to someone whose invitation would actually work.
+    val mayAddPeople = group != null && localKey != null &&
+        group.memberFor(localKey!!)?.role?.isAdministrative == true
+
+    if (addingPeople && group != null) {
+        AddPeopleDialog(
+            candidates = contacts.filterNot { group.isMember(it.publicKey) },
+            onDismiss = { addingPeople = false },
+            onConfirm = { chosen ->
+                addingPeople = false
+                chosen.forEach { viewModel.addToGroup(groupId, it) }
+            }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -78,6 +102,13 @@ fun GroupChatScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    if (mayAddPeople) {
+                        IconButton(onClick = { addingPeople = true }) {
+                            Icon(Icons.Filled.PersonAdd, contentDescription = "Add people")
+                        }
                     }
                 }
             )
@@ -224,4 +255,61 @@ fun AdvancedScreen(viewModel: MessengerViewModel) {
             Text("Your key: ${it.publicKey.hex}", style = MaterialTheme.typography.bodySmall)
         }
     }
+}
+
+/**
+ * Choose people to add to an existing group.
+ *
+ * Adding somebody sends them an invitation, which is what actually lets them see the conversation;
+ * without this the group's membership was fixed at the moment it was created.
+ */
+@Composable
+private fun AddPeopleDialog(
+    candidates: List<com.bitchat.android.messaging.contacts.Contact>,
+    onDismiss: () -> Unit,
+    onConfirm: (Set<MessagingPublicKey>) -> Unit
+) {
+    var selected by remember { mutableStateOf(setOf<MessagingPublicKey>()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add people") },
+        text = {
+            if (candidates.isEmpty()) {
+                Text("Everyone this device knows is already in the group.")
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(candidates, key = { it.publicKey.hex }) { contact ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selected = if (contact.publicKey in selected) {
+                                        selected - contact.publicKey
+                                    } else {
+                                        selected + contact.publicKey
+                                    }
+                                }
+                                .padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Checkbox(
+                                checked = contact.publicKey in selected,
+                                onCheckedChange = null
+                            )
+                            Text(contact.displayName, style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = selected.isNotEmpty(),
+                onClick = { onConfirm(selected) }
+            ) { Text("Add") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
