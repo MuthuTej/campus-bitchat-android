@@ -124,17 +124,32 @@ object CampusCredentialVerifier {
         data object UntrustedIssuer : Result
         data object Expired : Result
         data object Malformed : Result
+
+        /**
+         * The institution has withdrawn this credential before its expiry.
+         *
+         * Distinct from [Expired] because the two mean different things to a reader: an expired
+         * credential lapsed on schedule, while a revoked one was actively cancelled — typically
+         * because the key was compromised or the holder left. Only the second is a reason to
+         * distrust past messages from that key.
+         */
+        data object Revoked : Result
     }
 
     fun verify(
         credential: CampusCredential,
         trustAnchorsHex: List<String> = CampusConfig.trustedInstitutionKeys,
-        nowEpochSeconds: Long = System.currentTimeMillis() / 1000
+        nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
+        revokedKeysHex: Set<String> = CampusConfig.revokedSigningKeys
     ): Result {
         if (credential.signingPublicKeyHex.length != 64) return Result.Malformed
         if (CampusCanonical.unhex(credential.signingPublicKeyHex) == null) return Result.Malformed
         if (credential.institutionSignature.size != 64) return Result.Malformed
         if (credential.displayName.isBlank()) return Result.Malformed
+        // Checked before the signature: a revoked credential is one whose signature is still
+        // perfectly valid, so verifying first and revoking after would leave a window where a
+        // withdrawn identity still reads as genuine.
+        if (credential.signingPublicKeyHex.lowercase() in revokedKeysHex) return Result.Revoked
         if (credential.isExpiredAt(nowEpochSeconds)) return Result.Expired
 
         val message = credential.canonicalBytes()

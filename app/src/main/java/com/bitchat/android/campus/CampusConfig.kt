@@ -46,6 +46,19 @@ object CampusConfig {
      */
     val trustedInstitutionKeys: List<String> = emptyList()
 
+    /**
+     * Signing keys whose credentials the institution has withdrawn, hex, lowercase.
+     *
+     * Checked before a credential's signature, because a revoked credential still carries a valid
+     * signature — that is precisely why revocation has to exist separately from expiry. A key
+     * appears here when it was compromised or its holder left before the credential lapsed.
+     *
+     * Distributed with the app for now, which bounds how quickly a revocation can take effect to
+     * the release cadence. A deployment needing faster withdrawal would serve this list separately
+     * and signed by the same institutional anchor.
+     */
+    val revokedSigningKeys: Set<String> = emptySet()
+
     // MARK: - Classes
 
     data class CampusClass(

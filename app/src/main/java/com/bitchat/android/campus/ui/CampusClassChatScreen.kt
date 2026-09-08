@@ -66,6 +66,7 @@ fun CampusClassChatScreen(
     }
     val transfers by viewModel.transferProgress.collectAsState()
     var pendingDocument by remember { mutableStateOf<SelectedDocument?>(null) }
+    var choosingRecipientFor by remember { mutableStateOf<SelectedDocument?>(null) }
     var errorText by remember { mutableStateOf<String?>(null) }
     var showParticipants by remember { mutableStateOf(false) }
     val downloads by viewModel.downloads.collectAsState()
@@ -170,10 +171,26 @@ fun CampusClassChatScreen(
             CampusDocumentPreview(
                 document = document,
                 onCancel = { pendingDocument = null },
-                onSend = {
-                    viewModel.sendFileToOpenClass(document.fileName, document.mimeType, document.bytes)
+                onSend = { choosingRecipientFor = document }
+            )
+        }
+
+        // A document goes to one named person, never to the channel.
+        choosingRecipientFor?.let { document ->
+            CampusRecipientPicker(
+                fileName = document.fileName,
+                recipients = viewModel.availableRecipients(),
+                onSelect = { recipient ->
+                    viewModel.sendFileToPeer(
+                        recipient.peerId,
+                        document.fileName,
+                        document.mimeType,
+                        document.bytes
+                    )
+                    choosingRecipientFor = null
                     pendingDocument = null
-                }
+                },
+                onDismiss = { choosingRecipientFor = null }
             )
         }
 

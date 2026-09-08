@@ -180,6 +180,11 @@ class NotificationManager(
      * Show a notification for a private message with proper grouping and state awareness
      */
     fun showPrivateMessageNotification(senderPeerID: String, senderNickname: String, messageContent: String) {
+        // Machine traffic — delivery receipts, key distribution — arrives on the same private path
+        // as a message and would otherwise notify like one. An acknowledgement is not news, and a
+        // conversation generates one per message in each direction, so announcing them turns a
+        // working exchange into a stream of alerts.
+        if (messageContent.isBlank()) return
         val conversationID = ContactDirectory.canonicalConversationId(senderPeerID)
         if (conversationPreferences.isMuted(conversationID)) {
             Log.d(TAG, "Skipping muted conversation notification")

@@ -36,6 +36,21 @@ class CampusIdentityRegistry(
     private val verifiedByKey = ConcurrentHashMap<String, CampusCredential>()
 
     /**
+     * Keys that presented a credential which did not verify.
+     *
+     * Kept so that "claimed nothing" and "claimed something that failed" stay distinguishable. A
+     * failed credential used to be dropped silently, which made a forger indistinguishable from an
+     * ordinary user with no affiliation — and those two warrant very different treatment on screen.
+     */
+    private val rejectedKeys = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Credentials that were offered but did not verify, kept only so their standing can be
+     * reported. Never consulted for a name or a role.
+     */
+    private val offeredByKey = ConcurrentHashMap<String, CampusCredential>()
+
+    /**
      * Offer a credential to the registry.
      *
      * @return the verification result, so callers can distinguish "learned a new professor" from
@@ -43,10 +58,24 @@ class CampusIdentityRegistry(
      */
     fun learn(credential: CampusCredential): CampusCredentialVerifier.Result {
         val result = CampusCredentialVerifier.verify(credential, trustAnchorsHex, clockSeconds())
+        val key = credential.signingPublicKeyHex.lowercase()
         if (result is CampusCredentialVerifier.Result.Verified) {
-            verifiedByKey[credential.signingPublicKeyHex.lowercase()] = credential
+            verifiedByKey[key] = credential
+            offeredByKey.remove(key)
+            rejectedKeys.remove(key)
+        } else {
+            // A failed credential must never displace one that verified, or anyone could demote a
+            // genuine professor by relaying a forgery naming their key.
+            if (!verifiedByKey.containsKey(key)) offeredByKey[key] = credential
+            rejectedKeys.add(key)
         }
         return result
+    }
+
+    /** True when this key has ever offered a credential, whether or not it verified. */
+    fun hasSeenCredentialFor(signingKeyHex: String?): Boolean {
+        val key = signingKeyHex?.lowercase() ?: return false
+        return verifiedByKey.containsKey(key) || rejectedKeys.contains(key)
     }
 
     fun learnEncoded(token: String): CampusCredentialVerifier.Result {
@@ -79,6 +108,24 @@ class CampusIdentityRegistry(
     fun credentialForSigningKey(signingKeyHex: String?): CampusCredential? =
         signingKeyHex?.lowercase()?.let { verifiedByKey[it] }
 
+    /**
+     * The current verification standing of a key, or null if it has never offered a credential.
+     *
+     * Re-runs verification against *this registry's* trust anchors rather than leaving callers to
+     * repeat the check themselves. A caller that re-verified with its own defaults would silently
+     * disagree with the registry whenever the two were configured differently — which is exactly
+     * the bug this method exists to prevent, since the disagreement renders a genuine credential as
+     * a forged one.
+     *
+     * Re-checked on every read so expiry and revocation take effect without anything invalidating
+     * a cache.
+     */
+    fun verificationFor(signingKeyHex: String?): CampusCredentialVerifier.Result? {
+        val key = signingKeyHex?.lowercase() ?: return null
+        val credential = verifiedByKey[key] ?: offeredByKey[key] ?: return null
+        return CampusCredentialVerifier.verify(credential, trustAnchorsHex, clockSeconds())
+    }
+
     /** Every verified identity currently known, for the class participant list. */
     fun allVerifiedIdentities(): List<Identity.Verified> {
         val now = clockSeconds()
@@ -96,5 +143,9 @@ class CampusIdentityRegistry(
                 .thenBy { it.displayName })
     }
 
-    fun clear() = verifiedByKey.clear()
+    fun clear() {
+        verifiedByKey.clear()
+        offeredByKey.clear()
+        rejectedKeys.clear()
+    }
 }
