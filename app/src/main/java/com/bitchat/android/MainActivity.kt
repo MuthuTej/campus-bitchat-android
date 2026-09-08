@@ -39,8 +39,8 @@ import com.bitchat.android.onboarding.OnboardingCoordinator
 import com.bitchat.android.onboarding.OnboardingState
 import com.bitchat.android.onboarding.PermissionExplanationScreen
 import com.bitchat.android.onboarding.PermissionManager
-import com.bitchat.android.campus.CampusViewModel
-import com.bitchat.android.campus.ui.CampusShell
+import com.bitchat.android.messaging.ui.MessengerShell
+import com.bitchat.android.messaging.ui.MessengerViewModel
 import com.bitchat.android.ui.ChatScreen
 import com.bitchat.android.ui.ChatViewModel
 import com.bitchat.android.ui.OrientationAwareActivity
@@ -315,32 +315,39 @@ class MainActivity : OrientationAwareActivity() {
             }
 
             OnboardingState.CHECKING, OnboardingState.INITIALIZING, OnboardingState.COMPLETE -> {
-                // Set up back navigation handling for the chat screen
-                // The campus overlay owns its own tab/detail navigation, so it gets first refusal
-                // on the back gesture before the stock chat navigation state is consulted.
-                val campusViewModel = remember(chatViewModel) {
-                    if (BuildConfig.CAMPUS_MODE) CampusViewModel(application, chatViewModel) else null
-                }
-
-                val backCallback = object : OnBackPressedCallback(true) {
-                    override fun handleOnBackPressed() {
-                        // Let ChatViewModel handle navigation state
-                        val handled = campusViewModel?.handleBackPressed()
-                            ?: chatViewModel.handleBackPressed()
-                        if (!handled) {
-                            // If ChatViewModel doesn't handle it, disable this callback
-                            // and let the system handle it (which will exit the app)
-                            this.isEnabled = false
-                            onBackPressedDispatcher.onBackPressed()
-                            this.isEnabled = true
-                        }
+                // Set up back navigation handling for the chat screen.
+                // The messenger owns its own navigation graph and handles Back itself, so the
+                // stock chat navigation state is only consulted for the upstream build.
+                val messengerViewModel = remember(chatViewModel) {
+                    if (BuildConfig.CAMPUS_MODE) {
+                        MessengerViewModel(application, chatViewModel)
+                    } else {
+                        null
                     }
                 }
 
-                // Add the callback - this will be automatically removed when the activity is destroyed
-                onBackPressedDispatcher.addCallback(this, backCallback)
-                if (campusViewModel != null) {
-                    CampusShell(viewModel = campusViewModel)
+                // Only the upstream build needs this callback. The messenger's NavHost registers
+                // its own back handling, and an activity-level callback added alongside it would
+                // race for the gesture and pop the whole app instead of the current screen.
+                if (messengerViewModel == null) {
+                    val backCallback = object : OnBackPressedCallback(true) {
+                        override fun handleOnBackPressed() {
+                            // Let ChatViewModel handle navigation state
+                            val handled = chatViewModel.handleBackPressed()
+                            if (!handled) {
+                                // If ChatViewModel doesn't handle it, disable this callback
+                                // and let the system handle it (which will exit the app)
+                                this.isEnabled = false
+                                onBackPressedDispatcher.onBackPressed()
+                                this.isEnabled = true
+                            }
+                        }
+                    }
+                    // Automatically removed when the activity is destroyed
+                    onBackPressedDispatcher.addCallback(this, backCallback)
+                }
+                if (messengerViewModel != null) {
+                    MessengerShell(viewModel = messengerViewModel)
                 } else {
                     ChatScreen(viewModel = chatViewModel)
                 }

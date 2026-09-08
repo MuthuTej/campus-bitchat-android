@@ -16,6 +16,17 @@ object NotificationTextUtils {
      * - Text: original message content
      */
     fun buildPrivateMessagePreview(message: BitchatMessage): String {
+        // An application envelope wraps the text in framing that means nothing to a reader. Show
+        // what was actually written; control traffic has nothing to show and yields an empty
+        // preview, which the notifier treats as "do not announce this".
+        com.bitchat.android.messaging.protocol.MessagingEnvelope
+            .previewPayload(message.content)
+            ?.let { payload ->
+                return if (
+                    com.bitchat.android.messaging.protocol.MessagingEnvelope
+                        .isControlTraffic(message.content)
+                ) "" else payload
+            }
         return try {
             when (message.type) {
                 BitchatMessageType.Image -> "📷 sent an image"

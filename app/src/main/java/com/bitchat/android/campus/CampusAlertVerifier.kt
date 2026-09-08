@@ -31,6 +31,16 @@ object CampusAlertVerifier {
         data object CredentialExpired : Result
         data object AlertExpired : Result
 
+        /**
+         * The publisher's credential has been withdrawn by the institution.
+         *
+         * Kept separate from [CredentialExpired] because it is the more serious case: a lapsed
+         * credential is routine, whereas a withdrawn one usually means the signing key is
+         * compromised — and an alert is exactly what someone holding a stolen professor key would
+         * want to send.
+         */
+        data object PublisherRevoked : Result
+
         /** Not an alert envelope at all, or structurally broken. */
         data object Malformed : Result
         data object NotAnAlert : Result
@@ -39,7 +49,8 @@ object CampusAlertVerifier {
     fun verify(
         content: String,
         trustAnchorsHex: List<String> = CampusConfig.trustedInstitutionKeys,
-        nowEpochSeconds: Long = System.currentTimeMillis() / 1000
+        nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
+        revokedKeysHex: Set<String> = CampusConfig.revokedSigningKeys
     ): Result {
         if (!CampusAlert.looksLikeAlert(content)) return Result.NotAnAlert
         val (alert, credential) = CampusAlert.decode(content) ?: return Result.Malformed
@@ -60,10 +71,12 @@ object CampusAlertVerifier {
             return Result.BadAlertSignature
         }
 
-        when (val credentialResult =
-            CampusCredentialVerifier.verify(credential, trustAnchorsHex, nowEpochSeconds)) {
+        when (val credentialResult = CampusCredentialVerifier.verify(
+            credential, trustAnchorsHex, nowEpochSeconds, revokedKeysHex
+        )) {
             is CampusCredentialVerifier.Result.Verified -> Unit
             CampusCredentialVerifier.Result.Expired -> return Result.CredentialExpired
+            CampusCredentialVerifier.Result.Revoked -> return Result.PublisherRevoked
             CampusCredentialVerifier.Result.UntrustedIssuer -> return Result.UntrustedPublisher
             CampusCredentialVerifier.Result.Malformed -> return Result.Malformed
         }

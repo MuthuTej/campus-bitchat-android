@@ -27,27 +27,50 @@ class CampusViewModel(
     private val chatViewModel: ChatViewModel
 ) : ViewModel() {
 
-    private val identityStore = SecureIdentityStateManager(application.applicationContext)
-    private val alertSigner = CampusAlertSigner(application.applicationContext)
-    private val receivedFiles = CampusReceivedFileStore(application.applicationContext)
+    private val appContext = application.applicationContext
+    private val identityStore = SecureIdentityStateManager(appContext)
+    private val alertSigner = CampusAlertSigner(appContext)
+    private val receivedFiles = CampusReceivedFileStore(appContext)
 
     val identityRegistry = CampusIdentityRegistry()
 
     /**
-     * Transport binding for file transfers: every envelope goes out through the ordinary message
-     * path, so it inherits the existing encryption, routing, TTL and store-and-forward behaviour.
+     * Transport binding for file transfers.
+     *
+     * Every envelope is addressed to one peer and sent down the existing private-message path, so it
+     * inherits that path's Noise session encryption, routing and retry. It deliberately does NOT go
+     * through [ChatViewModel.sendMessage], which targets whatever conversation the user currently
+     * has open — that made file chunks broadcast into the class channel, where every member
+     * reassembled the document and answered with their own acknowledgements.
      */
     val fileTransfers = CampusFileTransferService(
-        // sendMessage reports acceptance through a callback that fires synchronously when the
-        // message is rejected outright. Optimistically assume success and downgrade on a synchronous
-        // rejection: a false negative here would park a healthy transfer, and the cumulative ACK
-        // recovers from a false positive on the next window anyway.
-        transport = { envelope ->
-            var accepted = true
-            chatViewModel.sendMessage(envelope) { ok -> accepted = ok }
-            accepted
-        }
+        transport = ::sendFileEnvelope
     )
+
+    /** Message IDs already fed to the transfer engine, so a re-emitted chat list is not replayed. */
+    private val consumedFileEnvelopes: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * Hand one addressed file envelope to the private-message router.
+     *
+     * Returns false — parking the transfer rather than failing it — whenever the peer has no
+     * established session. A chunk offered while the peer is unreachable would be enqueued in the
+     * router's shared per-peer outbox, which is bounded and evicts oldest-first, so a multi-chunk
+     * document would push the user's actual messages out of it. Parking instead lets
+     * [CampusFileTransferService.resumePausedTransfers] restart from the cumulative ACK when the
+     * peer returns, and any duplicate chunk that results is already handled by the receiver.
+     */
+    private fun sendFileEnvelope(recipient: String, envelope: String): Boolean {
+        val mesh = chatViewModel.meshServiceFacade
+        if (!mesh.hasEstablishedSession(recipient)) return false
+        val nickname = chatViewModel.peerNicknames.value[recipient] ?: recipient
+        val route = com.bitchat.android.services.MessageRouter
+            .getInstance(appContext, mesh)
+            .sendPrivate(envelope, recipient, nickname, java.util.UUID.randomUUID().toString())
+        return route == com.bitchat.android.services.MessageRouter.RouteResult.MESH ||
+            route == com.bitchat.android.services.MessageRouter.RouteResult.NOSTR
+    }
 
     data class ClassRow(
         val definition: CampusConfig.CampusClass,
@@ -205,13 +228,22 @@ class CampusViewModel(
             }
         }
 
-        // Consume file-protocol envelopes arriving in any class channel.
+        // Consume file-protocol envelopes from private conversations only.
+        //
+        // Channel traffic is deliberately not inspected: a file offer arriving over a broadcast
+        // channel has no single counterparty, so there is no peer whose acknowledgements could be
+        // trusted and no recipient the document was actually meant for.
         viewModelScope.launch {
-            chatViewModel.channelMessages.collect { channels ->
-                channels.values.flatten().forEach { message ->
-                    if (CampusFileMessage.looksLikeFileMessage(message.content)) {
-                        fileTransfers.handleIncoming(message.content)
-                    }
+            chatViewModel.privateChats.collect { chats ->
+                val myPeerID = chatViewModel.myPeerID
+                chats.values.flatten().forEach { message ->
+                    val origin = message.senderPeerID ?: return@forEach
+                    if (origin == myPeerID) return@forEach
+                    if (!CampusFileMessage.looksLikeFileMessage(message.content)) return@forEach
+                    // The chat list is re-emitted whole on every change; without this the engine
+                    // would see each envelope again on every subsequent message.
+                    if (!consumedFileEnvelopes.add(message.id)) return@forEach
+                    fileTransfers.handleIncoming(origin, message.content)
                 }
             }
         }
@@ -264,13 +296,63 @@ class CampusViewModel(
      * Every link is one the existing BitChat stack already authenticates, so a peer cannot present a
      * signing key they do not control.
      */
-    fun identityForMessage(message: BitchatMessage): CampusIdentityRegistry.Identity {
-        val peerId = message.senderPeerID
+    fun identityForMessage(message: BitchatMessage): CampusIdentityRegistry.Identity =
+        identityForPeer(message.senderPeerID, claimedNickname = message.sender)
+
+    /**
+     * Resolve the campus identity behind a peer ID, independent of any particular message.
+     *
+     * Same chain as [identityForMessage]; separated so surfaces that list people rather than
+     * messages — the recipient picker, and later the contacts and nearby screens — resolve names
+     * through exactly one code path.
+     */
+    fun identityForPeer(
+        peerId: String?,
+        claimedNickname: String? = null
+    ): CampusIdentityRegistry.Identity {
         val fingerprint = peerId?.let { chatViewModel.getMeshPeerFingerprint(it) }
         val signingKeyHex = fingerprint
             ?.let { identityStore.getAuthenticatedSigningKey(it) }
             ?.let(CampusCanonical::hex)
-        return identityRegistry.identityForSigningKey(signingKeyHex, message.sender)
+        val nickname = claimedNickname
+            ?: peerId?.let { chatViewModel.peerNicknames.value[it] }
+        return identityRegistry.identityForSigningKey(signingKeyHex, nickname)
+    }
+
+    /** A person a document can currently be sent to. */
+    data class Recipient(
+        val peerId: String,
+        val identity: CampusIdentityRegistry.Identity,
+        val displayName: String
+    )
+
+    /**
+     * People a document can be sent to right now.
+     *
+     * Restricted to peers with an established private session, because that is precisely the set
+     * for which an addressed transfer can start immediately rather than parking.
+     */
+    fun availableRecipients(): List<Recipient> {
+        val mesh = chatViewModel.meshServiceFacade
+        return chatViewModel.connectedPeers.value
+            .filter { mesh.hasEstablishedSession(it) }
+            .map { peerId ->
+                val identity = identityForPeer(peerId)
+                Recipient(
+                    peerId = peerId,
+                    identity = identity,
+                    displayName = when (identity) {
+                        is CampusIdentityRegistry.Identity.Verified -> identity.displayName
+                        is CampusIdentityRegistry.Identity.Unverified ->
+                            identity.claimedNickname ?: "Unknown user"
+                    }
+                )
+            }
+            .sortedWith(
+                compareByDescending<Recipient> {
+                    it.identity is CampusIdentityRegistry.Identity.Verified
+                }.thenBy { it.displayName.lowercase() }
+            )
     }
 
     fun displayNameFor(message: BitchatMessage): String =
@@ -353,12 +435,22 @@ class CampusViewModel(
         chatViewModel.sendMessage(safe)
     }
 
-    /** Begin a chunked, resumable transfer of [bytes] into the open class. */
-    fun sendFileToOpenClass(fileName: String, mimeType: String, bytes: ByteArray) {
-        if (_openClass.value == null) return
-        val transferId = fileTransfers.offerFile(fileName, mimeType, bytes)
+    /**
+     * Begin a chunked, resumable transfer of [bytes] to one peer.
+     *
+     * A document always has a named recipient. There is no broadcast form: sending coursework to
+     * "the class" would hand a copy to every device in range, including any that merely relays.
+     */
+    fun sendFileToPeer(peerId: String, fileName: String, mimeType: String, bytes: ByteArray) {
+        if (peerId.isBlank()) return
+        val transferId = fileTransfers.offerFile(peerId, fileName, mimeType, bytes)
         if (transferId == null) {
             _statusMessage.value = "That file type or size is not supported"
+            return
+        }
+        if (!chatViewModel.meshServiceFacade.hasEstablishedSession(peerId)) {
+            val name = chatViewModel.peerNicknames.value[peerId] ?: "that person"
+            _statusMessage.value = "Waiting for $name to come into range"
         }
     }
 
