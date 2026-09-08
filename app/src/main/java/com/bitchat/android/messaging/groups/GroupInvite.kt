@@ -1,6 +1,7 @@
 package com.bitchat.android.messaging.groups
 
 import com.bitchat.android.messaging.protocol.Canonical
+import com.bitchat.android.messaging.protocol.MessagingEnvelope
 
 /**
  * Being told a group exists.
@@ -34,10 +35,34 @@ data class GroupInvite(
     val keyMaterial: ByteArray
 ) {
 
-    fun encode(): String = PREFIX + Canonical.b64(
+    /**
+     * Encode so the result always fits the private path's 255-byte body.
+     *
+     * The name is the only part that can be any size, and it is the only part the group can do
+     * without — the id identifies the group and the key makes it readable. So the name is shortened
+     * until the invitation fits, rather than the invitation being sent over-length and silently
+     * refused, which would leave the group working for its creator and invisible to everyone else.
+     *
+     * A character is not a byte here: forty emoji are 160 bytes, so trimming has to be measured
+     * against the encoded result rather than the name's length.
+     */
+    fun encode(): String {
+        var name = groupName.take(MAX_NAME)
+        while (true) {
+            val encoded = encodeWith(name)
+            if (encoded.toByteArray(Charsets.UTF_8).size <= MessagingEnvelope.MAX_PAYLOAD_BYTES ||
+                name.isEmpty()
+            ) {
+                return encoded
+            }
+            name = name.dropLast(1)
+        }
+    }
+
+    private fun encodeWith(name: String): String = PREFIX + Canonical.b64(
         Canonical.encode(
             groupId,
-            groupName.take(MAX_NAME),
+            name,
             keyVersion.toString(),
             Canonical.b64(keyMaterial)
         )
@@ -71,7 +96,8 @@ data class GroupInvite(
             val fields = Canonical.decodeFields(raw, expected = 4) ?: return null
 
             val groupId = fields[0].takeIf { it.isNotBlank() && it.length <= 64 } ?: return null
-            val name = fields[1].trim().take(MAX_NAME).takeIf { it.isNotEmpty() } ?: return null
+            // A name trimmed away to nothing on the sender's side still leaves a usable group.
+            val name = fields[1].trim().take(MAX_NAME)
             val version = fields[2].toIntOrNull()?.takeIf { it > 0 } ?: return null
             val material = Canonical.unb64(fields[3])?.takeIf { it.size == GroupKey.KEY_BYTES }
                 ?: return null

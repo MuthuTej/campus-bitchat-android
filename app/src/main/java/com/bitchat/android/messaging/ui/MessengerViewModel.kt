@@ -451,10 +451,6 @@ class MessengerViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
     init {
-        android.util.Log.w(
-            "MsgRx",
-            "startup: myKeyPrefix=${_localKey.value?.hex?.take(16) ?: "NONE"}"
-        )
         viewModelScope.launch { identities.load() }
         restoreGroups()
         observeNameChanges()
@@ -475,6 +471,9 @@ class MessengerViewModel(
         viewModelScope.launch {
             groups.restore(groupStore.loadGroups())
             groupStore.loadKeys().forEach { (key, _) -> groupKeys.install(key) }
+            // Rejoin every group's channel. Membership is remembered across a restart, but
+            // listening is not, so without this a restored group goes quiet.
+            groups.groups.value.forEach { listenToGroupChannel(it.id) }
         }
     }
 
@@ -615,12 +614,6 @@ class MessengerViewModel(
                 chatViewModel.privateChats,
                 chatViewModel.connectedPeers
             ) { chats, _ -> chats }.collect { chats ->
-                android.util.Log.w(
-                    "MsgRx",
-                    "privateChats: conversations=${chats.size} " +
-                        "messages=${chats.values.sumOf { it.size }} " +
-                        "managerAttached=${directMessages != null}"
-                )
                 val dm = directMessages ?: return@collect
                 val myPeerId = chatViewModel.myPeerID
                 chats.forEach { (_, messages) ->
@@ -691,16 +684,6 @@ class MessengerViewModel(
                             timestampEpochMillis = message.timestamp.time,
                             authenticatedSender = sender
                         )
-                        android.util.Log.w(
-                            "MsgRx",
-                            "rx: envelope=" +
-                                com.bitchat.android.messaging.protocol.MessagingEnvelope
-                                    .looksLikeEnvelope(message.content) +
-                                " tag=" + message.content.drop(5).take(16) +
-                                " myPrefix=" + (_localKey.value?.hex?.take(16) ?: "none") +
-                                " senderPrefix=" + (sender?.hex?.take(16) ?: "NOT-PROVEN") +
-                                " result=" + admission::class.simpleName
-                        )
                         if (admission is com.bitchat.android.messaging.protocol
                                 .EnvelopeAdmission.Result.Admitted &&
                             admission.envelope.kind ==
@@ -725,20 +708,64 @@ class MessengerViewModel(
                         .map { it.content }
                 )
 
-                val gm = groupMessages ?: return@collect
-                channels.forEach { (_, messages) ->
-                    messages.forEach { message ->
-                        val peerId = message.senderPeerID ?: return@forEach
-                        if (peerId == chatViewModel.myPeerID) return@forEach
-                        gm.receive(
-                            content = message.content,
-                            timestampEpochMillis = message.timestamp.time,
-                            authenticatedSender = peerSource.authenticatedKeyFor(peerId)
-                        )
-                    }
+                drainGroupTraffic(channels)
+            }
+        }
+    }
+
+    /**
+     * Offer every message sitting in a group channel to the group layer.
+     *
+     * Re-examined in full rather than only as it arrives, because a message can turn out to be
+     * readable later than it appeared: the key or the group definition travels the private path and
+     * can land after the traffic it unlocks. Re-offering is safe — the group layer keeps one copy of
+     * each message id — and it is the only thing that rescues a message that arrived a moment early.
+     */
+    private fun drainGroupTraffic(
+        channels: Map<String, List<com.bitchat.android.model.BitchatMessage>> =
+            chatViewModel.channelMessages.value
+    ) {
+        val gm = groupMessages ?: return
+        channels.forEach { (_, messages) ->
+            messages.forEach { message ->
+                val peerId = message.senderPeerID ?: return@forEach
+                if (peerId == chatViewModel.myPeerID) return@forEach
+                val groupSender = peerSource.authenticatedKeyFor(peerId) ?: return@forEach
+
+                val outcome = gm.receive(
+                    content = message.content,
+                    timestampEpochMillis = message.timestamp.time,
+                    authenticatedSender = groupSender
+                )
+                // An invitation cannot carry the whole membership, so the list is completed from
+                // whoever turns out to hold the group key. The message is then offered again,
+                // since it was refused only for the gap that has just been filled.
+                if (outcome is GroupMessageManager.ReceiveResult.SenderNotAMember &&
+                    learnGroupMemberFrom(message.content, groupSender)
+                ) {
+                    gm.receive(
+                        content = message.content,
+                        timestampEpochMillis = message.timestamp.time,
+                        authenticatedSender = groupSender
+                    )
                 }
             }
         }
+    }
+
+    /**
+     * Record someone as a member because they spoke in the group.
+     *
+     * Only applied when the message decrypts under the group key, which nobody outside the group
+     * holds — so this adds people who have demonstrably been let in, rather than anyone who claims
+     * to belong.
+     */
+    private fun learnGroupMemberFrom(content: String, sender: MessagingPublicKey): Boolean {
+        val gm = groupMessages ?: return false
+        val groupId = gm.groupProvenByDecryption(content, sender) ?: return false
+        if (!groups.learnMember(groupId, sender)) return false
+        persistGroup(groupId)
+        return true
     }
 
     // MARK: - Actions
@@ -748,10 +775,6 @@ class MessengerViewModel(
         // Introduce ourselves before the first message, so the other side has a name for this
         // device rather than a hex key.
         shareProfileWith(recipient)
-        android.util.Log.w(
-            "MsgRx",
-            "send: toPrefix=${recipient.hex.take(16)} myPrefix=${_localKey.value?.hex?.take(16)}"
-        )
         when (dm.send(recipient, text)) {
             is DirectMessageManager.SendResult.BlockedRecipient ->
                 _status.value = "You have blocked this person"
@@ -813,7 +836,10 @@ class MessengerViewModel(
         }
         groupKeys.createInitialKey(outcome.group.id)
         persistGroup(outcome.group.id)
-        distributeGroupKey(outcome.group.id, members)
+        listenToGroupChannel(outcome.group.id)
+        // An invitation, not a bare key: the members do not yet know the group exists, so a key on
+        // its own would have nothing to unlock.
+        inviteToGroup(outcome.group.id, members)
         _status.value = "Group created"
     }
 
@@ -822,7 +848,7 @@ class MessengerViewModel(
         when (groups.addMember(me, groupId, member)) {
             is GroupManager.Outcome.Success -> {
                 persistGroup(groupId)
-                distributeGroupKey(groupId, setOf(member))
+                inviteToGroup(groupId, setOf(member))
             }
             GroupManager.Outcome.NotPermitted -> _status.value = "You cannot add members here"
             GroupManager.Outcome.AlreadyAMember -> _status.value = "Already in the group"
@@ -843,7 +869,7 @@ class MessengerViewModel(
                 groupKeys.rotate(groupId)
                 persistGroup(groupId)
                 val remaining = groups.group(groupId)?.memberKeys.orEmpty() - me
-                distributeGroupKey(groupId, remaining)
+                inviteToGroup(groupId, remaining)
                 _status.value = "Removed from group"
             }
             GroupManager.Outcome.CannotActOnOwner -> _status.value = "The owner cannot be removed"
@@ -870,6 +896,34 @@ class MessengerViewModel(
             persistGroup(groupId)
         } else {
             _status.value = "You cannot change permissions here"
+        }
+    }
+
+    /**
+     * Tell people they are in a group, and give them what they need to take part.
+     *
+     * Sent per recipient over the private path, so the key is never broadcast to the channel it
+     * protects — which would hand it to precisely the devices it is meant to exclude.
+     */
+    private fun inviteToGroup(groupId: String, recipients: Set<MessagingPublicKey>) {
+        val dm = directMessages ?: return
+        val group = groups.group(groupId) ?: return
+        val key = groupKeys.currentKey(groupId) ?: return
+        val invite = com.bitchat.android.messaging.groups.GroupInvite(
+            groupId = groupId,
+            groupName = group.name,
+            keyVersion = key.version,
+            keyMaterial = key.material
+        ).encode()
+
+        val failed = recipients
+            .filterNot { it == _localKey.value }
+            .count { dm.sendControl(it, invite) !is DirectMessageManager.SendResult.Accepted }
+
+        // Reported rather than swallowed: an invitation that never went out leaves someone in the
+        // group as far as this device is concerned and unable to see a word of it.
+        if (failed > 0) {
+            _status.value = "Could not invite $failed member${if (failed == 1) "" else "s"}"
         }
     }
 
@@ -901,6 +955,10 @@ class MessengerViewModel(
     private fun handleControlPayload(sender: MessagingPublicKey, payload: String) {
         if (com.bitchat.android.messaging.protocol.ProfileCard.looksLikeProfileCard(payload)) {
             handleProfileCard(sender, payload)
+            return
+        }
+        if (com.bitchat.android.messaging.groups.GroupInvite.looksLikeInvite(payload)) {
+            handleGroupInvite(sender, payload)
             return
         }
         handleKeyDistribution(sender, payload)
@@ -948,6 +1006,79 @@ class MessengerViewModel(
         dm.sendControl(recipient, card.encode())
     }
 
+    /**
+     * Join a group somebody added this device to.
+     *
+     * Everything needed to take part arrives together — which group, its name, and the key — because
+     * a device that had one without the other could neither read the conversation nor know where to
+     * look for it. The channel is joined here too: a member who never sends would otherwise never
+     * listen, and so would never receive anything.
+     */
+    private fun handleGroupInvite(sender: MessagingPublicKey, payload: String) {
+        val invite = com.bitchat.android.messaging.groups.GroupInvite.decode(payload) ?: return
+        val me = _localKey.value ?: return
+
+        // Refused before the group is written down, not after. Adopting it and then hiding it would
+        // still leave this device holding the key and listening to the channel.
+        if (!privacyPolicy.mayBeAddedToGroupBy(sender.hex)) return
+
+        val group = groups.adoptInvitation(
+            groupId = invite.groupId,
+            name = invite.groupName,
+            inviter = sender,
+            self = me
+        )
+        if (group == null) {
+            // Already a member. The invitation may still carry a key generation not yet held, which
+            // is how a rotation reaches someone who was offline when it happened.
+            acceptGroupKey(sender, invite)
+            return
+        }
+
+        groupKeys.install(
+            com.bitchat.android.messaging.groups.GroupKey(
+                groupId = invite.groupId,
+                version = invite.keyVersion,
+                material = invite.keyMaterial
+            )
+        )
+        listenToGroupChannel(invite.groupId)
+        persistGroup(invite.groupId)
+        // Anything already sitting in the channel was unreadable until this moment.
+        drainGroupTraffic()
+        _status.value = "You were added to ${invite.groupName}"
+    }
+
+    /** Take a key from an invitation, subject to the same authority check as any other. */
+    private fun acceptGroupKey(
+        sender: MessagingPublicKey,
+        invite: com.bitchat.android.messaging.groups.GroupInvite
+    ) {
+        val group = groups.group(invite.groupId) ?: return
+        if (group.memberFor(sender)?.role?.isAdministrative != true) return
+        val key = com.bitchat.android.messaging.groups.GroupKey(
+            groupId = invite.groupId,
+            version = invite.keyVersion,
+            material = invite.keyMaterial
+        )
+        if (groupKeys.install(key)) {
+            viewModelScope.launch { groupStore.saveKey(key, isCurrent = true) }
+        }
+        listenToGroupChannel(invite.groupId)
+        drainGroupTraffic()
+    }
+
+    /**
+     * Start receiving a group's traffic.
+     *
+     * Group messages are broadcast on a channel derived from the group's identity. Joining is what
+     * makes them arrive; without it a member is in the group as far as everyone else is concerned
+     * and hears nothing.
+     */
+    private fun listenToGroupChannel(groupId: String) {
+        chatViewModel.joinChannel(GroupMessageManager.channelTagFor(groupId), null)
+    }
+
     private fun handleKeyDistribution(
         sender: MessagingPublicKey,
         payload: String
@@ -971,6 +1102,8 @@ class MessengerViewModel(
             // Persisted immediately: a key accepted but not stored would leave every message sent
             // under it unreadable after the next restart.
             viewModelScope.launch { groupStore.saveKey(key, isCurrent = true) }
+            // Traffic sent under this generation may already have arrived and been set aside.
+            drainGroupTraffic()
         }
         return installed
     }
