@@ -937,6 +937,18 @@ class ChatViewModel(
 
     
     // MARK: - Message Sending
+
+    /**
+     * Broadcast a campus bulletin or credential card on the public mesh.
+     *
+     * The mesh transport does not put a channel name on a public packet, and [sendMessage] follows
+     * whichever conversation is open. Campus payloads are recognized by their own envelope instead,
+     * and sending one must not move the user into another chat.
+     */
+    fun broadcastMeshPayload(content: String) {
+        if (content.isEmpty()) return
+        mesh.sendMessage(content)
+    }
     
     fun sendMessage(
         content: String,

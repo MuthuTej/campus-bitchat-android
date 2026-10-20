@@ -53,12 +53,13 @@ fun ChatsScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         ReachabilityBanner(reachable)
 
-        // Alerts get their own entry rather than a row in the list, so an official announcement is
-        // never mistaken for a message from a person.
-        if (alerts.isNotEmpty()) {
-            AlertsEntry(count = alerts.size, onClick = onOpenAlerts)
-            HorizontalDivider()
-        }
+        // Bulletins stay above chats so an official notice is never read as a personal message.
+        AlertsEntry(
+            count = alerts.size,
+            latestTitle = alerts.firstOrNull()?.title,
+            onClick = onOpenAlerts
+        )
+        HorizontalDivider()
 
         if (conversations.isEmpty() && groups.isEmpty()) {
             EmptyState(
@@ -129,11 +130,11 @@ private fun ReachabilityBanner(reachableCount: Int) {
 
 /** A distinct, tinted entry for institutional announcements. */
 @Composable
-private fun AlertsEntry(count: Int, onClick: () -> Unit) {
+private fun AlertsEntry(count: Int, latestTitle: String?, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.errorContainer)
+            .background(MaterialTheme.colorScheme.tertiaryContainer)
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -142,19 +143,29 @@ private fun AlertsEntry(count: Int, onClick: () -> Unit) {
         Icon(
             Icons.Filled.Campaign,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onErrorContainer
+            tint = MaterialTheme.colorScheme.onTertiaryContainer
         )
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Campus alerts",
+                text = "Campus bulletins",
                 style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                color = MaterialTheme.colorScheme.onTertiaryContainer
             )
             Text(
-                text = if (count == 1) "1 announcement" else "$count announcements",
+                text = when {
+                    count == 0 -> "Official notices from staff. Not a personal chat."
+                    latestTitle != null -> latestTitle
+                    count == 1 -> "1 announcement"
+                    else -> "$count announcements"
+                },
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
+        }
+        if (count > 0) {
+            Badge { Text(count.toString()) }
         }
     }
 }

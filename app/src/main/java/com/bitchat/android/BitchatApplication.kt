@@ -76,6 +76,16 @@ class BitchatApplication : Application() {
         // Proactively start the foreground service to keep mesh alive
         try { com.bitchat.android.service.MeshForegroundService.start(this) } catch (_: Exception) { }
 
+        // Debug-only demo trust root. The class is absent from release builds; a real anchor
+        // list also suppresses it. Failure leaves verification fail-closed.
+        if (BuildConfig.DEBUG && BuildConfig.CAMPUS_MODE) {
+            try {
+                Class.forName("com.bitchat.android.campus.CampusDemoInstaller")
+                    .getMethod("install")
+                    .invoke(null)
+            } catch (_: Exception) { }
+        }
+
         // TorManager already initialized above
     }
 }

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -21,9 +22,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.bitchat.android.campus.CampusConfig
+import com.bitchat.android.campus.CampusPromotion
 
 /**
  * The user's own profile and settings.
@@ -38,8 +44,11 @@ fun ProfileScreen(
     onOpenAdvanced: () -> Unit
 ) {
     val identity by viewModel.localIdentity.collectAsState()
+    val standing by viewModel.campusStanding.collectAsState()
     var editingName by remember { mutableStateOf(false) }
     var nameDraft by remember { mutableStateOf("") }
+    var promotionCode by remember { mutableStateOf("") }
+    var credentialToken by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -80,14 +89,92 @@ fun ProfileScreen(
             ) { Text("Edit name") }
         }
 
-        // Stated as a fact, not an incompleteness. Most people have no institutional credential and
-        // the app works exactly the same for them.
         Text(
-            text = "Messaging account active",
+            text = when {
+                standing.emailVerified && standing.roleLabel != null ->
+                    "${standing.roleLabel} · ${standing.email}"
+                standing.email != null ->
+                    "${standing.email} · not institutionally verified"
+                else -> "College email not verified"
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        if (standing.canPublish) {
+            Text(
+                text = "You can publish campus bulletins.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Text(
+                text = "Students can message nearby. Publishing a bulletin needs staff approval.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
 
+        if (standing.canRequestPromotion) {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            Text("Staff bulletin rights", style = MaterialTheme.typography.titleSmall)
+            Text(
+                text = "Demo only. Enter ${CampusPromotion.PROFESSOR_CODE} for a professor, or " +
+                    "${CampusPromotion.ADMIN_CODE} for an admin. This is not a real campus root.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedTextField(
+                value = promotionCode,
+                onValueChange = { promotionCode = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Promotion code") },
+                singleLine = true
+            )
+            Button(
+                onClick = {
+                    if (viewModel.promoteWithCode(promotionCode)) promotionCode = ""
+                },
+                enabled = promotionCode.isNotBlank(),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Apply staff role")
+            }
+        }
+
+        if (!standing.demoVerification || !standing.emailVerified) {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            Text(
+                text = "Institutional credential",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "Paste a credential issued for this phone by ${CampusConfig.institutionName}. " +
+                    "A code for a different device is refused.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedTextField(
+                value = credentialToken,
+                onValueChange = { credentialToken = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Credential") },
+                minLines = 2
+            )
+            Button(
+                onClick = {
+                    if (viewModel.installCampusCredential(credentialToken.trim())) {
+                        credentialToken = ""
+                    }
+                },
+                enabled = credentialToken.isNotBlank(),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Install credential")
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
         SettingsRow("Privacy", "Who can message you, and what you share", onOpenPrivacy)

@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
  * Thread-safe: credentials are learned from mesh callbacks and read from Compose recomposition.
  */
 class CampusIdentityRegistry(
-    private val trustAnchorsHex: List<String> = CampusConfig.trustedInstitutionKeys,
+    private val trustAnchorsHex: List<String> = CampusConfig.activeTrustAnchors,
     private val clockSeconds: () -> Long = { System.currentTimeMillis() / 1000 }
 ) {
 
@@ -60,9 +60,18 @@ class CampusIdentityRegistry(
         val result = CampusCredentialVerifier.verify(credential, trustAnchorsHex, clockSeconds())
         val key = credential.signingPublicKeyHex.lowercase()
         if (result is CampusCredentialVerifier.Result.Verified) {
-            verifiedByKey[key] = credential
-            offeredByKey.remove(key)
-            rejectedKeys.remove(key)
+            val existing = verifiedByKey[key]
+            val stale = existing != null &&
+                !existing.isExpiredAt(clockSeconds()) &&
+                credential.issuedAtEpochSeconds < existing.issuedAtEpochSeconds
+            // A newer institution-signed credential may promote or demote. An older one, still
+            // valid, must not replace it: otherwise a replay of a student credential would wipe a
+            // later staff promotion for the same key.
+            if (!stale) {
+                verifiedByKey[key] = credential
+                offeredByKey.remove(key)
+                rejectedKeys.remove(key)
+            }
         } else {
             // A failed credential must never displace one that verified, or anyone could demote a
             // genuine professor by relaying a forgery naming their key.

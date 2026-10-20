@@ -138,7 +138,7 @@ object CampusCredentialVerifier {
 
     fun verify(
         credential: CampusCredential,
-        trustAnchorsHex: List<String> = CampusConfig.trustedInstitutionKeys,
+        trustAnchorsHex: List<String> = CampusConfig.activeTrustAnchors,
         nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
         revokedKeysHex: Set<String> = CampusConfig.revokedSigningKeys
     ): Result {

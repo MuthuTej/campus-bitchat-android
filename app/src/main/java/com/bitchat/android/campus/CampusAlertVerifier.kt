@@ -31,6 +31,9 @@ object CampusAlertVerifier {
         data object CredentialExpired : Result
         data object AlertExpired : Result
 
+        /** Timestamp is further ahead than the allowed clock skew. */
+        data object NotYetValid : Result
+
         /**
          * The publisher's credential has been withdrawn by the institution.
          *
@@ -48,7 +51,7 @@ object CampusAlertVerifier {
 
     fun verify(
         content: String,
-        trustAnchorsHex: List<String> = CampusConfig.trustedInstitutionKeys,
+        trustAnchorsHex: List<String> = CampusConfig.activeTrustAnchors,
         nowEpochSeconds: Long = System.currentTimeMillis() / 1000,
         revokedKeysHex: Set<String> = CampusConfig.revokedSigningKeys
     ): Result {
@@ -82,6 +85,9 @@ object CampusAlertVerifier {
         }
 
         if (!credential.role.canPublishAlerts) return Result.UnauthorizedRole(credential.role)
+        if (alert.timestampEpochSeconds > nowEpochSeconds + CampusConfig.maxAlertClockSkewSeconds) {
+            return Result.NotYetValid
+        }
         if (alert.isExpiredAt(nowEpochSeconds)) return Result.AlertExpired
 
         return Result.Verified(alert, credential)

@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -20,6 +21,20 @@ require(
 ) {
     "BITCHAT_GITHUB_RELEASE_CERT_SHA256 must be a SHA-256 certificate fingerprint"
 }
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) file.inputStream().use(::load)
+}
+
+/** Value for a BuildConfig string. Secrets stay in gitignored local.properties. */
+fun localProperty(name: String): String =
+    (localProperties.getProperty(name) ?: "")
+        .trim()
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "")
+        .replace("\r", "")
 
 android {
     namespace = "com.bitchat.android"
@@ -45,6 +60,9 @@ android {
             "CAMPUS_MODE",
             (project.findProperty("campusMode")?.toString() ?: "true")
         )
+        buildConfigField("String", "BREVO_API_KEY", "\"${localProperty("brevo.api.key")}\"")
+        buildConfigField("String", "BREVO_SENDER_EMAIL", "\"${localProperty("brevo.sender.email")}\"")
+        buildConfigField("String", "BREVO_SENDER_NAME", "\"${localProperty("brevo.sender.name")}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

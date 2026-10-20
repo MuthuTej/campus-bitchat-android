@@ -143,6 +143,16 @@ class CampusAlertVerifierTest {
     }
 
     @Test
+    fun `an alert dated too far in the future is rejected`() {
+        val (_, envelope) = professorEnvelope(timestamp = now + CampusConfig.maxAlertClockSkewSeconds + 60)
+
+        assertEquals(
+            CampusAlertVerifier.Result.NotYetValid,
+            CampusAlertVerifier.verify(envelope, anchors, now)
+        )
+    }
+
+    @Test
     fun `plain text is not treated as an alert`() {
         assertEquals(
             CampusAlertVerifier.Result.NotAnAlert,

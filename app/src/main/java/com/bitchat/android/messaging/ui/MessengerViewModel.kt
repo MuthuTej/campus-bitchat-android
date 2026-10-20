@@ -28,7 +28,11 @@ import com.bitchat.android.messaging.settings.PrivacySettingsStore
 import com.bitchat.android.messaging.transport.MeshOutboundTransport
 import com.bitchat.android.messaging.transport.MeshPeerIdentitySource
 import com.bitchat.android.ui.ChatViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -94,6 +98,16 @@ class MessengerViewModel(
      * relationship an optional layer should have to the thing it sits on.
      */
     val campusIdentities = com.bitchat.android.campus.CampusIdentityRegistry()
+
+    private val campusDirectory = java.io.File(appContext.filesDir, "campus")
+    private val deviceStore = com.bitchat.android.campus.CampusDeviceStore(campusDirectory)
+    private val bulletinStore =
+        com.bitchat.android.campus.CampusBulletinStore.inDirectory(campusDirectory)
+    private val bulletinRelay = com.bitchat.android.campus.CampusBulletinRelay()
+    private var pendingEmailChallenge: com.bitchat.android.campus.CampusEmailChallenge? = null
+    private var bulletinGossipJob: Job? = null
+    private val seenCampusPayloads: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
     private val attestations: com.bitchat.android.messaging.identity.AttestationProvider =
         com.bitchat.android.campus.CampusAttestationProvider(campusIdentities)
@@ -248,8 +262,23 @@ class MessengerViewModel(
         val body: String,
         val publisherName: String,
         val publisherSubtitle: String,
-        val timestampMillis: Long
+        val timestampMillis: Long,
+        val expiresAtMillis: Long
     )
+
+    /** What Profile shows about college email and bulletin rights. */
+    data class CampusStanding(
+        val email: String? = null,
+        val emailVerified: Boolean = false,
+        val roleLabel: String? = null,
+        val verifiedName: String? = null,
+        val canPublish: Boolean = false,
+        val demoVerification: Boolean = false,
+        val canRequestPromotion: Boolean = false
+    )
+
+    private val _campusStanding = MutableStateFlow(CampusStanding())
+    val campusStanding: StateFlow<CampusStanding> = _campusStanding
 
     private val _alerts = MutableStateFlow<List<VerifiedAlert>>(emptyList())
 
@@ -286,11 +315,11 @@ class MessengerViewModel(
         }
         return when (val outcome = alertSigner.publish(title, body, credential)) {
             is com.bitchat.android.campus.CampusAlertSigner.Outcome.Signed -> {
-                broadcastToChannel(
-                    com.bitchat.android.campus.CampusConfig.ALERTS_CHANNEL,
-                    outcome.envelope
-                )
-                _status.value = "Alert published"
+                bulletinStore.retain(outcome.alert, outcome.envelope)
+                seenCampusPayloads.add(outcome.envelope)
+                publishAlertsFromStore()
+                broadcastCampus(outcome.envelope)
+                _status.value = "Bulletin published"
                 true
             }
             com.bitchat.android.campus.CampusAlertSigner.Outcome.NotAuthorised -> {
@@ -308,43 +337,238 @@ class MessengerViewModel(
         }
     }
 
-    private fun broadcastToChannel(channelTag: String, content: String) {
-        chatViewModel.joinChannel(channelTag, null)
-        chatViewModel.switchToChannel(channelTag)
-        chatViewModel.sendMessage(content)
+    private val emailMailer = com.bitchat.android.campus.CampusBrevoMailer(
+        apiKey = com.bitchat.android.BuildConfig.BREVO_API_KEY,
+        senderEmail = com.bitchat.android.BuildConfig.BREVO_SENDER_EMAIL,
+        senderName = com.bitchat.android.BuildConfig.BREVO_SENDER_NAME
+    )
+
+    /**
+     * Create a one-time code and mail it to the college address.
+     *
+     * The code is not returned. A failed send forgets the challenge, so a code that never left
+     * the phone cannot be guessed from the screen.
+     */
+    suspend fun requestEmailCode(email: String): com.bitchat.android.campus.CampusEmailSendResult {
+        val challenge = com.bitchat.android.campus.CampusEmailChallenge.issue(email)
+            ?: return com.bitchat.android.campus.CampusEmailSendResult.Failed(
+                "Enter a college email address"
+            )
+        if (!com.bitchat.android.campus.CampusConfig.demoIssuerAvailable) {
+            return com.bitchat.android.campus.CampusEmailSendResult.Failed(
+                "This build cannot verify a college email"
+            )
+        }
+        val result = withContext(Dispatchers.IO) {
+            emailMailer.sendVerificationCode(challenge.email, challenge.code)
+        }
+        pendingEmailChallenge = if (result is com.bitchat.android.campus.CampusEmailSendResult.Sent) {
+            challenge
+        } else {
+            null
+        }
+        return result
     }
 
-    /** Re-verify every alert seen in the alerts channel. */
-    private fun refreshAlerts(rawMessages: List<String>) {
-        var rejected = 0
-        val verified = rawMessages.mapNotNull { content ->
-            if (!com.bitchat.android.campus.CampusAlert.looksLikeAlert(content)) {
-                return@mapNotNull null
-            }
+    fun confirmEmailCode(email: String, code: String): Boolean {
+        val challenge = pendingEmailChallenge ?: return false
+        return challenge.matches(email, code, System.currentTimeMillis())
+    }
+
+    /**
+     * Promote this device from a verified student to staff.
+     *
+     * Refuses unless a demo issuer is armed and this device already holds a verified credential.
+     * The new credential is signed and replaces the previous one only because it is newer.
+     */
+    fun promoteWithCode(code: String): Boolean {
+        val issuer = com.bitchat.android.campus.CampusDemoHooks.issuer ?: run {
+            _status.value = "Staff promotion is not available on this build"
+            return false
+        }
+        val role = com.bitchat.android.campus.CampusPromotion.roleFor(code) ?: run {
+            _status.value = "That promotion code was not accepted"
+            return false
+        }
+        val current = localCredential() ?: run {
+            _status.value = "Verify your college email before requesting staff rights"
+            return false
+        }
+        val issued = issuer.issue(
+            displayName = current.displayName,
+            role = role,
+            department = current.department.ifBlank { "Campus" },
+            signingPublicKeyHex = current.signingPublicKeyHex
+        ) ?: run {
+            _status.value = "Could not issue that role"
+            return false
+        }
+        rememberCredential(issued, asLocal = true)
+        broadcastCampus(com.bitchat.android.campus.CampusCredentialAnnouncement.encode(issued))
+        _status.value = "Campus role is now ${role.displayLabel}"
+        return true
+    }
+
+    /** Re-verify retained bulletins and rebuild the list the UI is allowed to show. */
+    private fun publishAlertsFromStore() {
+        val now = System.currentTimeMillis() / 1000
+        val anchors = com.bitchat.android.campus.CampusConfig.activeTrustAnchors
+        val verified = bulletinStore.activeEnvelopes().mapNotNull { envelope ->
             when (
-                val result = com.bitchat.android.campus.CampusAlertVerifier.verify(content)
+                val decision = com.bitchat.android.campus.CampusBulletinAdmission.decide(
+                    envelope, anchors, now
+                )
             ) {
-                is com.bitchat.android.campus.CampusAlertVerifier.Result.Verified -> {
-                    // Learning the publisher's credential here means their name also resolves on
-                    // contact profiles, without a separate directory.
-                    campusIdentities.learn(result.publisher)
-                    VerifiedAlert(
-                        id = result.alert.alertId,
-                        title = result.alert.title,
-                        body = result.alert.body,
-                        publisherName = result.publisher.displayName,
-                        publisherSubtitle = listOf(
-                            result.publisher.role.displayLabel,
-                            result.publisher.department
-                        ).filter { it.isNotBlank() }.joinToString(" · "),
-                        timestampMillis = result.alert.timestampEpochSeconds * 1000
-                    )
+                is com.bitchat.android.campus.CampusBulletinAdmission.Decision.Retain -> {
+                    campusIdentities.learn(decision.publisher)
+                    verifiedAlert(decision)
                 }
-                else -> { rejected++; null }
+                else -> null
             }
         }
-        _rejectedAlertCount.value = rejected
         _alerts.value = verified.distinctBy { it.id }.sortedByDescending { it.timestampMillis }
+    }
+
+    private fun verifiedAlert(
+        decision: com.bitchat.android.campus.CampusBulletinAdmission.Decision.Retain
+    ): VerifiedAlert = VerifiedAlert(
+        id = decision.alert.alertId,
+        title = decision.alert.title,
+        body = decision.alert.body,
+        publisherName = decision.publisher.displayName,
+        publisherSubtitle = listOf(
+            decision.publisher.role.displayLabel,
+            decision.publisher.department
+        ).filter { it.isNotBlank() }.joinToString(" · "),
+        timestampMillis = decision.alert.timestampEpochSeconds * 1000,
+        expiresAtMillis = if (decision.alert.expiresAtEpochSeconds == 0L) {
+            0L
+        } else {
+            decision.alert.expiresAtEpochSeconds * 1000
+        }
+    )
+
+    /**
+     * Accept a campus payload from the mesh, or ignore it.
+     *
+     * Bulletins are public broadcasts. The transport does not label them with a channel, so the
+     * envelope itself is the only thing that identifies one. Invalid envelopes are counted and
+     * dropped. They are never stored and never offered to a later device.
+     */
+    private fun considerCampusPayload(content: String) {
+        if (content.isEmpty() || !seenCampusPayloads.add(content)) return
+        if (com.bitchat.android.campus.CampusCredentialAnnouncement.looksLike(content)) {
+            val credential = com.bitchat.android.campus.CampusCredentialAnnouncement.decode(content)
+                ?: return
+            rememberCredential(credential, asLocal = false)
+            return
+        }
+        when (val decision = com.bitchat.android.campus.CampusBulletinAdmission.decide(content)) {
+            is com.bitchat.android.campus.CampusBulletinAdmission.Decision.Retain -> {
+                rememberCredential(decision.publisher, asLocal = false)
+                bulletinStore.retain(decision.alert, content)
+                publishAlertsFromStore()
+            }
+            is com.bitchat.android.campus.CampusBulletinAdmission.Decision.Reject ->
+                _rejectedAlertCount.value = _rejectedAlertCount.value + 1
+            com.bitchat.android.campus.CampusBulletinAdmission.Decision.Ignore -> Unit
+        }
+    }
+
+    private fun rememberCredential(
+        credential: com.bitchat.android.campus.CampusCredential,
+        asLocal: Boolean
+    ) {
+        val result = campusIdentities.learn(credential)
+        if (result !is com.bitchat.android.campus.CampusCredentialVerifier.Result.Verified) return
+        val kept = campusIdentities.credentialForSigningKey(credential.signingPublicKeyHex) ?: return
+        deviceStore.saveCredential(kept)
+        val mine = _localKey.value?.hex
+        if (asLocal && mine != null && kept.signingPublicKeyHex.equals(mine, ignoreCase = true)) {
+            deviceStore.setLocalToken(kept.encode())
+        }
+        refreshStanding()
+    }
+
+    private fun localCredential(): com.bitchat.android.campus.CampusCredential? =
+        _localKey.value?.let { campusIdentities.credentialForSigningKey(it.hex) }
+
+    private fun refreshStanding() {
+        val credential = localCredential()
+        _campusStanding.value = CampusStanding(
+            email = deviceStore.email,
+            emailVerified = deviceStore.emailVerified && credential != null,
+            roleLabel = credential?.role?.displayLabel,
+            verifiedName = credential?.displayName,
+            canPublish = credential?.role?.canPublishAlerts == true,
+            demoVerification = com.bitchat.android.campus.CampusConfig.demoIssuerAvailable,
+            canRequestPromotion = com.bitchat.android.campus.CampusConfig.demoIssuerAvailable &&
+                credential != null &&
+                credential.role != com.bitchat.android.campus.CampusRole.ADMIN
+        )
+    }
+
+    private fun restoreCampusState() {
+        deviceStore.loadCredentials().forEach { campusIdentities.learn(it) }
+        deviceStore.localCredentialToken?.let { token ->
+            com.bitchat.android.campus.CampusCredential.decode(token)?.let { campusIdentities.learn(it) }
+        }
+        publishAlertsFromStore()
+        refreshStanding()
+    }
+
+    private fun onLocalKeyReady() {
+        ensureStudentCredential()
+        refreshStanding()
+    }
+
+    /** Issue a student credential after a simulated college-email check. Never a staff role. */
+    private fun ensureStudentCredential() {
+        val issuer = com.bitchat.android.campus.CampusDemoHooks.issuer ?: return
+        if (!deviceStore.emailVerified) return
+        val key = _localKey.value ?: return
+        if (campusIdentities.credentialForSigningKey(key.hex) != null) return
+        val name = identityManager.identity.value?.displayName?.takeIf { it.isNotBlank() } ?: return
+        val credential = issuer.issue(
+            displayName = name,
+            role = com.bitchat.android.campus.CampusRole.STUDENT,
+            department = "Student",
+            signingPublicKeyHex = key.hex
+        ) ?: return
+        rememberCredential(credential, asLocal = true)
+        broadcastCampus(com.bitchat.android.campus.CampusCredentialAnnouncement.encode(credential))
+    }
+
+    private fun gossipPayloads(): List<String> {
+        val now = System.currentTimeMillis() / 1000
+        val anchors = com.bitchat.android.campus.CampusConfig.activeTrustAnchors
+        val bulletins = bulletinStore.activeEnvelopes().filter { envelope ->
+            com.bitchat.android.campus.CampusBulletinAdmission.decide(envelope, anchors, now) is
+                com.bitchat.android.campus.CampusBulletinAdmission.Decision.Retain
+        }
+        val card = localCredential()?.let {
+            com.bitchat.android.campus.CampusCredentialAnnouncement.encode(it)
+        }
+        return (bulletins + listOfNotNull(card)).distinct()
+    }
+
+    private fun watchPeersForLatePickup() {
+        viewModelScope.launch {
+            chatViewModel.connectedPeers.collect { peers ->
+                bulletinGossipJob?.cancel()
+                bulletinGossipJob = viewModelScope.launch {
+                    delay(1_500)
+                    bulletinRelay.onPeers(peers.toSet(), gossipPayloads())
+                        .forEach { broadcastCampus(it) }
+                }
+            }
+        }
+    }
+
+    /** Public mesh send that does not change the open conversation. */
+    private fun broadcastCampus(content: String) {
+        if (content.isBlank()) return
+        chatViewModel.broadcastMeshPayload(content)
     }
 
     /**
@@ -365,6 +589,10 @@ class MessengerViewModel(
         }
         val result = campusIdentities.learn(credential)
         return if (result is com.bitchat.android.campus.CampusCredentialVerifier.Result.Verified) {
+            rememberCredential(credential, asLocal = true)
+            broadcastCampus(
+                com.bitchat.android.campus.CampusCredentialAnnouncement.encode(credential)
+            )
             _status.value = "Campus identity verified"
             true
         } else {
@@ -422,16 +650,33 @@ class MessengerViewModel(
     private val _status = MutableStateFlow<String?>(null)
     val status: StateFlow<String?> = _status
 
-    private val _needsSetup = MutableStateFlow(!identityManager.hasCompletedSetup())
+    private val _needsSetup = MutableStateFlow(shouldShowSetup())
 
-    /** True until the user has chosen a display name for themselves. */
+    /**
+     * True until the user has a name and, when demo verification is armed, a checked college email.
+     * An existing profile without that email is sent through setup again so bulletin identity is
+     * not skipped on upgrade.
+     */
     val needsSetup: StateFlow<Boolean> = _needsSetup
 
+    private fun shouldShowSetup(): Boolean {
+        if (!identityManager.hasCompletedSetup()) return true
+        return com.bitchat.android.campus.CampusConfig.demoIssuerAvailable && !deviceStore.emailVerified
+    }
+
     /** Record the profile the user entered at first run. */
-    fun completeSetup(displayName: String, phoneNumber: String?) {
+    fun completeSetup(
+        displayName: String,
+        phoneNumber: String?,
+        email: String,
+        emailVerified: Boolean
+    ) {
         identityManager.completeSetup(displayName, phoneNumber)
         chatViewModel.setNickname(displayName)
+        deviceStore.setEmail(email, emailVerified)
         _needsSetup.value = false
+        ensureStudentCredential()
+        refreshStanding()
     }
 
     val nearby: StateFlow<List<NearbyPeer>> get() = discovery.nearby
@@ -451,6 +696,7 @@ class MessengerViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
 
     init {
+        restoreCampusState()
         viewModelScope.launch { identities.load() }
         restoreGroups()
         observeNameChanges()
@@ -459,6 +705,7 @@ class MessengerViewModel(
         bindLocalIdentity()
         observeIncoming()
         bindFileTransfers()
+        watchPeersForLatePickup()
     }
 
     /**
@@ -559,6 +806,7 @@ class MessengerViewModel(
     }
 
     private fun attachManagers(key: MessagingPublicKey) {
+        onLocalKeyReady()
         if (directMessages != null) return
         val dm = DirectMessageManager(
             localKey = key,
@@ -700,15 +948,17 @@ class MessengerViewModel(
         }
         viewModelScope.launch {
             chatViewModel.channelMessages.collect { channels ->
-                // Alerts carry their own signature chain and are verified independently of who
-                // relayed them, so unlike group traffic they need no authenticated peer.
-                refreshAlerts(
-                    channels[com.bitchat.android.campus.CampusConfig.ALERTS_CHANNEL]
-                        .orEmpty()
-                        .map { it.content }
-                )
-
+                // Older builds filed bulletins under the alerts channel. The wire format is the
+                // same envelope either way, and it is verified on its own signatures.
+                channels[com.bitchat.android.campus.CampusConfig.ALERTS_CHANNEL]
+                    .orEmpty()
+                    .forEach { considerCampusPayload(it.content) }
                 drainGroupTraffic(channels)
+            }
+        }
+        viewModelScope.launch {
+            chatViewModel.messages.collect { messages ->
+                messages.forEach { considerCampusPayload(it.content) }
             }
         }
     }

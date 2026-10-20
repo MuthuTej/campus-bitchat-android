@@ -15,7 +15,7 @@ import java.security.MessageDigest
  */
 object CampusConfig {
 
-    const val institutionName: String = "Example Institute of Technology"
+    const val institutionName: String = "Chennai Institute of Technology"
     const val academicYear: String = "2026"
 
     /**
@@ -45,6 +45,32 @@ object CampusConfig {
      * it is better to show every user as unverified than to invent a trust decision.
      */
     val trustedInstitutionKeys: List<String> = emptyList()
+
+    /**
+     * Anchors the running app actually verifies against.
+     *
+     * Real anchors always apply. A debug demo root is added only after [CampusDemoHooks] is armed,
+     * which the installer refuses to do once a real anchor is configured.
+     */
+    val activeTrustAnchors: List<String>
+        get() {
+            val demo = CampusDemoHooks.issuer?.publicKeyHex?.lowercase() ?: return trustedInstitutionKeys
+            if (demo.length != 64) return trustedInstitutionKeys
+            if (trustedInstitutionKeys.any { it.equals(demo, ignoreCase = true) }) {
+                return trustedInstitutionKeys
+            }
+            return trustedInstitutionKeys + demo
+        }
+
+    /** True when this process can simulate college-email issuance locally. */
+    val demoIssuerAvailable: Boolean
+        get() = CampusDemoHooks.issuer != null
+
+    /**
+     * Domains that count as this institution. Subdomains match.
+     * College addresses look like `name.dept2024@citchennai.net`.
+     */
+    val institutionalEmailDomains: List<String> = listOf("citchennai.net")
 
     /**
      * Signing keys whose credentials the institution has withdrawn, hex, lowercase.

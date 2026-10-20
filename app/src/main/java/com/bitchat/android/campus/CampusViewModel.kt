@@ -151,13 +151,18 @@ class CampusViewModel(
      * to a plain chat message, because an unverified string that reads "class cancelled" is exactly
      * the payload this whole mechanism exists to suppress.
      */
-    val alerts: StateFlow<List<DisplayedAlert>> = chatViewModel.channelMessages
-        .map { channelMessages ->
-            val raw = channelMessages[CampusConfig.ALERTS_CHANNEL].orEmpty()
+    val alerts: StateFlow<List<DisplayedAlert>> = combine(
+        chatViewModel.channelMessages,
+        chatViewModel.messages
+    ) { channelMessages, publicMessages ->
+            val raw = (
+                channelMessages[CampusConfig.ALERTS_CHANNEL].orEmpty().map { it.content } +
+                    publicMessages.map { it.content }
+                ).distinct()
             var rejected = 0
-            val verified = raw.mapNotNull { message ->
-                if (!CampusAlert.looksLikeAlert(message.content)) return@mapNotNull null
-                when (val result = CampusAlertVerifier.verify(message.content)) {
+            val verified = raw.mapNotNull { content ->
+                if (!CampusAlert.looksLikeAlert(content)) return@mapNotNull null
+                when (val result = CampusAlertVerifier.verify(content)) {
                     is CampusAlertVerifier.Result.Verified -> {
                         // Learning the publisher's credential here means their name also resolves in
                         // class chats and the participant list, without a separate directory.

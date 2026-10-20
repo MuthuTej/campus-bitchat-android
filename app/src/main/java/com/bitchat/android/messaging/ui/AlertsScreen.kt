@@ -59,7 +59,7 @@ fun AlertsScreen(viewModel: MessengerViewModel, onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Campus alerts") },
+                title = { Text("Campus bulletins") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -82,10 +82,30 @@ fun AlertsScreen(viewModel: MessengerViewModel, onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            Text(
+                text = "Signed staff notices. Nearby phones keep them until they expire, so " +
+                    "someone who arrives later can still pick one up. This is best-effort, not " +
+                    "an emergency system.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+            )
+            if (com.bitchat.android.campus.CampusConfig.demoIssuerAvailable &&
+                com.bitchat.android.campus.CampusConfig.isDemoDeployment
+            ) {
+                Text(
+                    text = "Demo trust root. Signatures are checked, but this is not a real " +
+                        "institution key.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
             if (alerts.isEmpty()) {
                 EmptyState(
-                    title = "No alerts",
-                    detail = "Official announcements from your institution appear here."
+                    title = "No bulletins",
+                    detail = "Class changes, exam rooms, bus timings and safety notes from " +
+                        "approved staff appear here."
                 )
             } else {
                 LazyColumn(
@@ -129,7 +149,7 @@ private fun AlertCard(alert: MessengerViewModel.VerifiedAlert) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.errorContainer)
+            .background(MaterialTheme.colorScheme.tertiaryContainer)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
@@ -140,42 +160,49 @@ private fun AlertCard(alert: MessengerViewModel.VerifiedAlert) {
             Icon(
                 Icons.Filled.Campaign,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.onErrorContainer
+                tint = MaterialTheme.colorScheme.onTertiaryContainer
             )
             Text(
                 text = alert.title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                color = MaterialTheme.colorScheme.onTertiaryContainer
             )
         }
 
         Text(
             text = alert.body,
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onErrorContainer
+            color = MaterialTheme.colorScheme.onTertiaryContainer
         )
 
         Text(
             text = "Issued by ${alert.publisherName}" +
                 alert.publisherSubtitle.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty(),
             style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onErrorContainer
+            color = MaterialTheme.colorScheme.onTertiaryContainer
         )
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "✓ Institution verified",
+                text = "Verified signature",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                color = MaterialTheme.colorScheme.onTertiaryContainer
             )
             Text(
                 text = formatTimestamp(alert.timestampMillis),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onErrorContainer
+                color = MaterialTheme.colorScheme.onTertiaryContainer
             )
+            if (alert.expiresAtMillis > 0L) {
+                Text(
+                    text = "Until ${formatTimestamp(alert.expiresAtMillis)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                )
+            }
         }
     }
 }
@@ -194,22 +221,24 @@ private fun AlertComposer(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "This is sent to everyone on campus and signed with your institutional " +
-                        "identity.",
+                    text = "Nearby phones relay this and keep it until it expires. It is signed " +
+                        "with your staff credential. Delivery is best-effort.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 OutlinedTextField(
                     value = title,
-                    onValueChange = { title = it },
+                    onValueChange = { if (it.length <= 80) title = it },
                     label = { Text("Title") },
-                    singleLine = true
+                    singleLine = true,
+                    supportingText = { Text("${title.length}/80") }
                 )
                 OutlinedTextField(
                     value = body,
-                    onValueChange = { body = it },
+                    onValueChange = { if (it.length <= 500) body = it },
                     label = { Text("Message") },
-                    maxLines = 6
+                    maxLines = 6,
+                    supportingText = { Text("${body.length}/500") }
                 )
             }
         },

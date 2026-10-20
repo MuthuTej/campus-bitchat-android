@@ -90,7 +90,12 @@ fun MessengerShell(viewModel: MessengerViewModel) {
     // First run: ask who they are before anything else. The messenger is unusable in a meaningful
     // sense until the user has a name, since every other device would otherwise see a number.
     if (needsSetup) {
-        MessengerOnboardingScreen(onComplete = viewModel::completeSetup)
+        MessengerOnboardingScreen(
+            demoVerification = com.bitchat.android.campus.CampusConfig.demoIssuerAvailable,
+            onRequestCode = viewModel::requestEmailCode,
+            onConfirmCode = viewModel::confirmEmailCode,
+            onComplete = viewModel::completeSetup
+        )
         return
     }
 
